@@ -32,6 +32,7 @@ from AppKit import (
     NSView,
     NSViewController,
 )
+from Cocoa import CAKeyframeAnimation
 from Foundation import NSObject
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
@@ -293,9 +294,11 @@ class StockBarApp(NSObject):
         self.input_field.setPlaceholderString_("Mã CK…")
         self.input_field.setTarget_(self)
         self.input_field.setAction_("onAdd:")  # Enter trong ô = Add
+        self.input_field.setWantsLayer_(True)  # để vẽ viền đỏ khi mã sai
+        self.input_field.layer().setCornerRadius_(4.0)
         add_row.addArrangedSubview_(self.input_field)
-        add_btn = NSButton.buttonWithTitle_target_action_("Add", self, "onAdd:")
-        add_row.addArrangedSubview_(add_btn)
+        self.add_btn = NSButton.buttonWithTitle_target_action_("Add", self, "onAdd:")
+        add_row.addArrangedSubview_(self.add_btn)
         stack.addArrangedSubview_(add_row)
 
         refresh_btn = NSButton.buttonWithTitle_target_action_(
@@ -340,13 +343,49 @@ class StockBarApp(NSObject):
 
     # --- edit watchlist ---
     def onAdd_(self, sender):
+        self.input_field.layer().setBorderWidth_(0.0)  # clear viền đỏ lần trước
         code = normalize_code(self.input_field.stringValue())
-        if not code or code in self.codes:  # chặn rỗng + trùng
-            self.input_field.setStringValue_("")
+        if not code:
+            self._warn_invalid_input()
             return
-        self.codes.append(code)
+        if code in self.codes:  # trùng -> báo lỗi luôn, khỏi gọi API
+            self._warn_invalid_input()
+            return
+        # Check mã có thật qua API (off main thread, không block UI).
+        self.add_btn.setEnabled_(False)
+        self.add_btn.setTitle_("Checking…")
+        threading.Thread(target=self._validate_bg, args=(code,), daemon=True).start()
+
+    def _validate_bg(self, code):
+        try:
+            valid = fetch_one(code).get("price") is not None
+        except Exception:
+            valid = False  # lỗi mạng coi như chưa xác thực được -> báo lỗi
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "_afterValidate:", {"code": code, "valid": valid}, False
+        )
+
+    def _afterValidate_(self, result):
+        self.add_btn.setEnabled_(True)
+        self.add_btn.setTitle_("Add")
+        if not result["valid"]:
+            self._warn_invalid_input()
+            return
+        self.codes.append(result["code"])
         self.input_field.setStringValue_("")
         self._apply_watchlist_change()
+
+    def _warn_invalid_input(self):
+        """Ô nhập viền đỏ + rung để báo mã không hợp lệ."""
+        layer = self.input_field.layer()
+        layer.setBorderColor_(NSColor.systemRedColor().CGColor())
+        layer.setBorderWidth_(2.0)
+        f = self.input_field.frame()
+        cx = f.origin.x + f.size.width / 2
+        shake = CAKeyframeAnimation.animationWithKeyPath_("position.x")
+        shake.setValues_([cx, cx - 6, cx + 6, cx - 4, cx + 4, cx])
+        shake.setDuration_(0.3)
+        layer.addAnimation_forKey_(shake, "shake")
 
     def onRemove_(self, sender):
         i = sender.tag()
