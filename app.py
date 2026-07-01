@@ -8,24 +8,30 @@ from datetime import datetime
 import requests
 import rumps
 from AppKit import (
-    NSAttributedString,
     NSColor,
     NSFont,
     NSFontAttributeName,
     NSForegroundColorAttributeName,
+    NSMutableAttributedString,
 )
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 API_URL = "https://api-finfo.vndirect.com.vn/v4/stock_prices"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# Màu theo trạng thái giá (đúng convention bảng giá VN).
+
+def _rgb(r, g, b):
+    return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, 1.0)
+
+
+# Màu theo bảng giá VN — RGB đậm/tươi tự set để nổi trên nền menu
+# (màu systemXxx của macOS bị làm nhạt, lu mờ trên background).
 STATUS_COLORS = {
-    "ceiling": NSColor.systemPurpleColor,  # trần: tím
-    "floor": NSColor.systemTealColor,      # sàn: cyan
-    "up": NSColor.systemGreenColor,        # tăng: xanh
-    "down": NSColor.systemRedColor,        # giảm: đỏ
-    "ref": NSColor.systemYellowColor,      # tham chiếu: vàng
+    "ceiling": lambda: _rgb(0.80, 0.40, 1.00),  # trần: tím tươi
+    "floor": lambda: _rgb(0.00, 0.80, 0.85),    # sàn: cyan đậm
+    "up": lambda: _rgb(0.15, 0.85, 0.35),       # tăng: xanh lá tươi
+    "down": lambda: _rgb(1.00, 0.30, 0.30),     # giảm: đỏ tươi
+    "ref": lambda: _rgb(1.00, 0.75, 0.10),      # tham chiếu: vàng đậm
 }
 
 
@@ -105,31 +111,44 @@ def format_volume(vol):
 
 
 def format_row(stock):
-    """1 mã -> 1 dòng menu, VD: 'HPG   23.45  ▲+2.99%   13.9M'. ▲/▼ + màu."""
+    """1 mã -> (text, chg_start, chg_len).
+
+    chg_start/chg_len = vị trí đoạn '▲+2.99%' để tô màu riêng; phần còn lại
+    (mã, giá, volume) để labelColor cho rõ. VD: 'HPG   23.45  ▲+2.99%   13.9M'.
+    """
     code = stock["code"]
     price = stock.get("price")
     if price is None:
-        return f"{code:<5} —"
+        text = f"{code:<5} —"
+        return text, 0, 0
     change = stock.get("change") or 0.0
     pct = stock.get("changePct") or 0.0
     arrow = "▲" if change > 0 else ("▼" if change < 0 else "—")
     sign = "+" if change > 0 else ""
     vol = format_volume(stock.get("volume"))
-    return f"{code:<5} {price:>7.2f}  {arrow}{sign}{pct:.2f}%   {vol:>6}"
+    chg = f"{arrow}{sign}{pct:.2f}%"
+    prefix = f"{code:<5} {price:>7.2f}  "
+    text = f"{prefix}{chg}   {vol:>6}"
+    return text, len(prefix), len(chg)
 
 
-def set_colored_title(menu_item, text, status):
-    """Set title cho menu item với màu theo status (NSAttributedString + font menu).
+def set_colored_title(menu_item, text, chg_start, chg_len, status):
+    """Set title menu item: cả dòng semibold + labelColor, riêng đoạn %[chg] tô màu.
 
-    NSMenuItem thường không tô màu chữ; phải đi qua attributedTitle của AppKit.
+    NSMenuItem không tô màu chữ mặc định; phải đi qua attributedTitle. Dùng
+    mutable string để set nhiều màu theo range trên cùng 1 dòng.
     """
-    color = STATUS_COLORS[status]()
-    font = NSFont.menuFontOfSize_(0)  # 0 = size mặc định của menu
-    attrs = {
-        NSForegroundColorAttributeName: color,
-        NSFontAttributeName: font,
-    }
-    astr = NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+    astr = NSMutableAttributedString.alloc().initWithString_(text)
+    full = (0, len(text))
+    semibold = NSFont.systemFontOfSize_weight_(0, 0.3)  # ~semibold, dày dễ đọc
+    astr.addAttribute_value_range_(NSFontAttributeName, semibold, full)
+    astr.addAttribute_value_range_(
+        NSForegroundColorAttributeName, NSColor.labelColor(), full
+    )
+    if chg_len:
+        astr.addAttribute_value_range_(
+            NSForegroundColorAttributeName, STATUS_COLORS[status](), (chg_start, chg_len)
+        )
     menu_item._menuitem.setAttributedTitle_(astr)
 
 
@@ -164,7 +183,10 @@ class StockBarApp(rumps.App):
             stocks = fetch_prices(self._row_keys)
             self.last_stocks = stocks
             for s in stocks:
-                set_colored_title(self.menu[s["code"]], format_row(s), price_status(s))
+                text, chg_start, chg_len = format_row(s)
+                set_colored_title(
+                    self.menu[s["code"]], text, chg_start, chg_len, price_status(s)
+                )
             self.menu["status"].title = f"Cập nhật: {now}"
             self.title = "📈"
         except Exception:
