@@ -1,4 +1,8 @@
 {
-  "watchlist": ["HPG", "FPT", "VCB"],
+  "watchlist": [
+    "GMD",
+    "HPG",
+    "SHS"
+  ],
   "refresh_seconds": 30
 }
