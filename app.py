@@ -1,19 +1,35 @@
 #!/usr/bin/env python3
-"""VN Stock menu bar app — icon trên topbar, click xem giá watchlist."""
+"""VN Stock menu bar app — icon topbar, click bung panel nền trắng xem giá."""
 
 import json
 import os
 from datetime import datetime
 
+import objc
 import requests
-import rumps
 from AppKit import (
+    NSApplication,
+    NSApplicationActivationPolicyAccessory,
+    NSButton,
     NSColor,
     NSFont,
     NSFontAttributeName,
     NSForegroundColorAttributeName,
+    NSLayoutAttributeLeading,
+    NSMakeRect,
     NSMutableAttributedString,
+    NSPopover,
+    NSPopoverBehaviorTransient,
+    NSRectEdgeMaxY,
+    NSStackView,
+    NSStatusBar,
+    NSTextField,
+    NSUserInterfaceLayoutOrientationVertical,
+    NSVariableStatusItemLength,
+    NSView,
+    NSViewController,
 )
+from Foundation import NSObject, NSTimer
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 API_URL = "https://api-finfo.vndirect.com.vn/v4/stock_prices"
@@ -132,68 +148,141 @@ def format_row(stock):
     return text, len(prefix), len(chg)
 
 
-def set_colored_title(menu_item, text, chg_start, chg_len, status):
-    """Set title menu item: cả dòng semibold + labelColor, riêng đoạn %[chg] tô màu.
+ROW_FONT_SIZE = 13.0
+BLACK = NSColor.blackColor
+GRAY = lambda: _rgb(0.45, 0.45, 0.45)  # volume xám nhạt
 
-    NSMenuItem không tô màu chữ mặc định; phải đi qua attributedTitle. Dùng
-    mutable string để set nhiều màu theo range trên cùng 1 dòng.
+
+def _mono(size=ROW_FONT_SIZE, weight=0.4):
+    return NSFont.monospacedSystemFontOfSize_weight_(size, weight)
+
+
+def make_row_label(stock):
+    """1 mã -> NSTextField: mã/giá/volume ĐEN đậm, chỉ đoạn %[chg] tô màu status.
+
+    Dùng monospaced font để mọi cột thẳng hàng (width cố định theo dòng dài nhất).
     """
+    text, chg_start, chg_len = format_row(stock)
     astr = NSMutableAttributedString.alloc().initWithString_(text)
-    full = (0, len(text))
-    semibold = NSFont.systemFontOfSize_weight_(0, 0.3)  # ~semibold, dày dễ đọc
-    astr.addAttribute_value_range_(NSFontAttributeName, semibold, full)
+    astr.addAttribute_value_range_(NSFontAttributeName, _mono(), (0, len(text)))
     astr.addAttribute_value_range_(
-        NSForegroundColorAttributeName, NSColor.labelColor(), full
+        NSForegroundColorAttributeName, BLACK(), (0, len(text))
     )
     if chg_len:
         astr.addAttribute_value_range_(
-            NSForegroundColorAttributeName, STATUS_COLORS[status](), (chg_start, chg_len)
+            NSForegroundColorAttributeName,
+            STATUS_COLORS[price_status(stock)](),
+            (chg_start, chg_len),
         )
-    menu_item._menuitem.setAttributedTitle_(astr)
+    return NSTextField.labelWithAttributedString_(astr)
 
 
-class StockBarApp(rumps.App):
-    def __init__(self):
-        super().__init__("📈", quit_button=None)
+def make_text_label(text, color, weight=0.4):
+    astr = NSMutableAttributedString.alloc().initWithString_(text)
+    astr.addAttribute_value_range_(NSFontAttributeName, _mono(weight=weight), (0, len(text)))
+    astr.addAttribute_value_range_(NSForegroundColorAttributeName, color, (0, len(text)))
+    return NSTextField.labelWithAttributedString_(astr)
+
+
+class StockBarApp(NSObject):
+    """App thuần PyObjC: NSStatusItem (icon) + NSPopover nền trắng + NSTimer."""
+
+    def init(self):
+        self = objc.super(StockBarApp, self).init()
+        if self is None:
+            return None
         self.cfg = load_config()
-        self.last_stocks = None  # giữ giá cũ khi fetch fail
+        self.codes = self.cfg["watchlist"]
+        self.last_stocks = None
 
-        # Build menu shell 1 lần; nội dung mã cập nhật sau qua refresh().
-        self._row_keys = self.cfg["watchlist"]
-        self.menu = [
-            *self._row_keys,
-            rumps.separator,
-            "status",
-            rumps.separator,
-            rumps.MenuItem("Refresh now", callback=self.on_refresh),
-            rumps.MenuItem("Quit", callback=rumps.quit_application),
-        ]
-        self.menu["status"].set_callback(None)  # dòng status không click được
+        # Status item + icon topbar; click button -> toggle popover.
+        self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+            NSVariableStatusItemLength
+        )
+        btn = self.status_item.button()
+        btn.setTitle_("📈")
+        btn.setTarget_(self)
+        btn.setAction_("togglePopover:")
 
-        self.refresh(None)  # fetch ngay khi mở
-        self.timer = rumps.Timer(self.refresh, self.cfg["refresh_seconds"])
-        self.timer.start()
+        self.popover = NSPopover.alloc().init()
+        self.popover.setBehavior_(NSPopoverBehaviorTransient)  # click ngoài -> đóng
 
-    def on_refresh(self, _):
-        self.refresh(None)
+        self.refresh_(None)  # fetch ngay
+        self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            float(self.cfg["refresh_seconds"]), self, "refresh:", None, True
+        )
+        return self
 
-    def refresh(self, _):
+    # --- data ---
+    def refresh_(self, _timer):
         now = datetime.now().strftime("%H:%M:%S")
         try:
-            stocks = fetch_prices(self._row_keys)
-            self.last_stocks = stocks
-            for s in stocks:
-                text, chg_start, chg_len = format_row(s)
-                set_colored_title(
-                    self.menu[s["code"]], text, chg_start, chg_len, price_status(s)
-                )
-            self.menu["status"].title = f"Cập nhật: {now}"
-            self.title = "📈"
+            self.last_stocks = fetch_prices(self.codes)
+            self.status_text = f"Cập nhật: {now}"
+            self.status_item.button().setTitle_("📈")
         except Exception:
-            # Giữ giá cũ, chỉ báo lỗi ở dòng status + đổi icon.
-            self.menu["status"].title = f"⚠️ Không cập nhật được ({now})"
-            self.title = "⚠️"
+            self.status_text = f"⚠️ Không cập nhật được ({now})"
+            self.status_item.button().setTitle_("⚠️")
+        # Nếu popover đang mở, dựng lại nội dung cho tươi.
+        if self.popover.isShown():
+            self._rebuild_panel()
+
+    # --- UI ---
+    def _rebuild_panel(self):
+        stack = NSStackView.alloc().initWithFrame_(NSMakeRect(0, 0, 10, 10))
+        stack.setOrientation_(NSUserInterfaceLayoutOrientationVertical)
+        stack.setAlignment_(NSLayoutAttributeLeading)
+        stack.setSpacing_(5.0)
+
+        for s in (self.last_stocks or []):
+            stack.addArrangedSubview_(make_row_label(s))
+
+        stack.addArrangedSubview_(
+            make_text_label(getattr(self, "status_text", ""), GRAY(), weight=0.3)
+        )
+
+        refresh_btn = NSButton.buttonWithTitle_target_action_(
+            "Refresh now", self, "onRefresh:"
+        )
+        quit_btn = NSButton.buttonWithTitle_target_action_("Quit", self, "onQuit:")
+        stack.addArrangedSubview_(refresh_btn)
+        stack.addArrangedSubview_(quit_btn)
+
+        fit = stack.fittingSize()
+        pad = 14.0
+        view = NSView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, fit.width + 2 * pad, fit.height + 2 * pad)
+        )
+        view.setWantsLayer_(True)
+        view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+        stack.setFrameOrigin_((pad, pad))
+        view.addSubview_(stack)
+
+        vc = NSViewController.alloc().init()
+        vc.setView_(view)
+        self.popover.setContentViewController_(vc)
+        self.popover.setContentSize_((fit.width + 2 * pad, fit.height + 2 * pad))
+
+    def togglePopover_(self, sender):
+        if self.popover.isShown():
+            self.popover.performClose_(sender)
+        else:
+            self._rebuild_panel()
+            btn = self.status_item.button()
+            self.popover.showRelativeToRect_ofView_preferredEdge_(
+                btn.bounds(), btn, NSRectEdgeMaxY
+            )
+
+    def onRefresh_(self, sender):
+        self.refresh_(None)
+        self._rebuild_panel()  # cập nhật panel ngay
+
+    def onQuit_(self, sender):
+        NSApplication.sharedApplication().terminate_(sender)
 
 
 if __name__ == "__main__":
-    StockBarApp().run()
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)  # menu bar only
+    delegate = StockBarApp.alloc().init()
+    app.run()
