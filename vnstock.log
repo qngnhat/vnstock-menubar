@@ -6,3 +6,49 @@
   view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
 /Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0xac1b2aee0 of type ^{CGColor=}@:
   view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cb9b60 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cbb240 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cba820 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cba700 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989f10480 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cbb5a0 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989f12d00 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cb92c0 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cba9a0 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cbb8a0 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989f10a80 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cba280 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989f10240 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cba1c0 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cbb960 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989f10fc0 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cbb780 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cbb9c0 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989f12e80 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cb8e40 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989f10f60 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989cb9620 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+/Users/qngnhat/bong/vnstock-menubar/app.py:257: ObjCPointerWarning: PyObjCPointer created: at 0x989f10060 of type ^{CGColor=}@:
+  view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())

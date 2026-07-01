@@ -24,6 +24,7 @@ from AppKit import (
     NSStackView,
     NSStatusBar,
     NSTextField,
+    NSUserInterfaceLayoutOrientationHorizontal,
     NSUserInterfaceLayoutOrientationVertical,
     NSVariableStatusItemLength,
     NSView,
@@ -57,6 +58,16 @@ def load_config():
     cfg.setdefault("watchlist", ["HPG"])
     cfg.setdefault("refresh_seconds", 30)
     return cfg
+
+
+def save_config(cfg):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def normalize_code(raw):
+    """Chuẩn hoá mã: bỏ khoảng trắng, viết hoa. '' nếu rỗng."""
+    return (raw or "").strip().upper()
 
 
 def fetch_one(code):
@@ -234,12 +245,36 @@ class StockBarApp(NSObject):
         stack.setAlignment_(NSLayoutAttributeLeading)
         stack.setSpacing_(5.0)
 
-        for s in (self.last_stocks or []):
-            stack.addArrangedSubview_(make_row_label(s))
+        # Mỗi mã 1 row ngang: [label giá] [nút ✕ xóa]. Tag nút = index để biết xóa mã nào.
+        stocks = self.last_stocks or []
+        for i, s in enumerate(stocks):
+            row = NSStackView.alloc().initWithFrame_(NSMakeRect(0, 0, 10, 10))
+            row.setOrientation_(NSUserInterfaceLayoutOrientationHorizontal)
+            row.setSpacing_(8.0)
+            row.addArrangedSubview_(make_row_label(s))
+            x_btn = NSButton.buttonWithTitle_target_action_("✕", self, "onRemove:")
+            x_btn.setTag_(i)
+            x_btn.setBezelStyle_(0)  # bezel gọn
+            row.addArrangedSubview_(x_btn)
+            stack.addArrangedSubview_(row)
 
         stack.addArrangedSubview_(
             make_text_label(getattr(self, "status_text", ""), GRAY(), weight=0.3)
         )
+
+        # Dòng thêm mã: [ô nhập] [Add].
+        add_row = NSStackView.alloc().initWithFrame_(NSMakeRect(0, 0, 10, 10))
+        add_row.setOrientation_(NSUserInterfaceLayoutOrientationHorizontal)
+        add_row.setSpacing_(6.0)
+        self.input_field = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 90, 22))
+        self.input_field.setEditable_(True)
+        self.input_field.setPlaceholderString_("Mã CK…")
+        self.input_field.setTarget_(self)
+        self.input_field.setAction_("onAdd:")  # Enter trong ô = Add
+        add_row.addArrangedSubview_(self.input_field)
+        add_btn = NSButton.buttonWithTitle_target_action_("Add", self, "onAdd:")
+        add_row.addArrangedSubview_(add_btn)
+        stack.addArrangedSubview_(add_row)
 
         refresh_btn = NSButton.buttonWithTitle_target_action_(
             "Refresh now", self, "onRefresh:"
@@ -281,6 +316,29 @@ class StockBarApp(NSObject):
 
     def onQuit_(self, sender):
         NSApplication.sharedApplication().terminate_(sender)
+
+    # --- edit watchlist ---
+    def onAdd_(self, sender):
+        code = normalize_code(self.input_field.stringValue())
+        if not code or code in self.codes:  # chặn rỗng + trùng
+            self.input_field.setStringValue_("")
+            return
+        self.codes.append(code)
+        self.input_field.setStringValue_("")
+        self._apply_watchlist_change()
+
+    def onRemove_(self, sender):
+        i = sender.tag()
+        if 0 <= i < len(self.codes):
+            del self.codes[i]
+            self._apply_watchlist_change()
+
+    def _apply_watchlist_change(self):
+        """Ghi config.json + fetch giá mới ngay + dựng lại panel."""
+        self.cfg["watchlist"] = self.codes
+        save_config(self.cfg)
+        self.refresh_(None)  # fetch mã mới (bên trong tự rebuild nếu popover mở)
+        self._rebuild_panel()
 
 
 if __name__ == "__main__":
