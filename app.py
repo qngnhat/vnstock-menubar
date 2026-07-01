@@ -255,7 +255,9 @@ class StockBarApp(NSObject):
         )
         view.setWantsLayer_(True)
         view.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
-        stack.setFrameOrigin_((pad, pad))
+        # Stack có translatesAutoresizingMask=True nên phải áp frame=fittingSize;
+        # nếu chỉ set origin, stack kẹt 10x10 và các row chồng nhau ở góc.
+        stack.setFrame_(NSMakeRect(pad, pad, fit.width, fit.height))
         view.addSubview_(stack)
 
         vc = NSViewController.alloc().init()
