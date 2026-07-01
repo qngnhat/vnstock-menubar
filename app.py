@@ -3,6 +3,8 @@
 
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import objc
@@ -30,7 +32,7 @@ from AppKit import (
     NSView,
     NSViewController,
 )
-from Foundation import NSObject, NSTimer
+from Foundation import NSObject
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 API_URL = "https://api-finfo.vndirect.com.vn/v4/stock_prices"
@@ -101,8 +103,15 @@ def fetch_one(code):
 
 
 def fetch_prices(codes):
-    """Lấy giá từng mã trong watchlist, giữ đúng thứ tự. Trả list dict."""
-    return [fetch_one(c) for c in codes]
+    """Lấy giá các mã SONG SONG, giữ đúng thứ tự. Trả list dict.
+
+    ThreadPoolExecutor.map giữ order theo input; song song ~3x nhanh hơn tuần tự
+    (mỗi mã 1 HTTP ~300ms, 5 mã tuần tự 1.3s -> song song ~0.4s).
+    """
+    if not codes:
+        return []
+    with ThreadPoolExecutor(max_workers=min(len(codes), 8)) as ex:
+        return list(ex.map(fetch_one, codes))
 
 
 def price_status(stock):
@@ -196,7 +205,7 @@ def make_text_label(text, color, weight=0.4):
 
 
 class StockBarApp(NSObject):
-    """App thuần PyObjC: NSStatusItem (icon) + NSPopover nền trắng + NSTimer."""
+    """App thuần PyObjC: NSStatusItem (icon) + NSPopover nền trắng. Fetch thủ công."""
 
     def init(self):
         self = objc.super(StockBarApp, self).init()
@@ -218,23 +227,34 @@ class StockBarApp(NSObject):
         self.popover = NSPopover.alloc().init()
         self.popover.setBehavior_(NSPopoverBehaviorTransient)  # click ngoài -> đóng
 
-        self.refresh_(None)  # fetch ngay
-        self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            float(self.cfg["refresh_seconds"]), self, "refresh:", None, True
-        )
+        self.refresh_(None)  # fetch 1 lần lúc mở; sau đó chỉ fetch khi bấm Refresh
         return self
 
     # --- data ---
     def refresh_(self, _timer):
+        """Kick off fetch trên background thread; UI không bao giờ đơ vì mạng."""
+        codes = list(self.codes)  # snapshot, tránh race khi user đang edit
+        threading.Thread(target=self._fetch_bg, args=(codes,), daemon=True).start()
+
+    def _fetch_bg(self, codes):
         now = datetime.now().strftime("%H:%M:%S")
         try:
-            self.last_stocks = fetch_prices(self.codes)
-            self.status_text = f"Cập nhật: {now}"
-            self.status_item.button().setTitle_("📈")
+            stocks = fetch_prices(codes)
+            result = {"stocks": stocks, "status": f"Cập nhật: {now}", "ok": True}
         except Exception:
-            self.status_text = f"⚠️ Không cập nhật được ({now})"
+            result = {"status": f"⚠️ Không cập nhật được ({now})", "ok": False}
+        # AppKit: mọi update UI phải về main thread.
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "_applyFetchResult:", result, False
+        )
+
+    def _applyFetchResult_(self, result):
+        if result["ok"]:
+            self.last_stocks = result["stocks"]
+            self.status_item.button().setTitle_("📈")
+        else:
             self.status_item.button().setTitle_("⚠️")
-        # Nếu popover đang mở, dựng lại nội dung cho tươi.
+        self.status_text = result["status"]
         if self.popover.isShown():
             self._rebuild_panel()
 
@@ -245,9 +265,11 @@ class StockBarApp(NSObject):
         stack.setAlignment_(NSLayoutAttributeLeading)
         stack.setSpacing_(5.0)
 
-        # Mỗi mã 1 row ngang: [label giá] [nút ✕ xóa]. Tag nút = index để biết xóa mã nào.
-        stocks = self.last_stocks or []
-        for i, s in enumerate(stocks):
+        # Iterate theo self.codes (nguồn chân lý) để tag nút ✕ = index trong codes,
+        # tránh lệch khi fetch nền chưa kịp cập nhật last_stocks sau Add/Remove.
+        by_code = {s["code"]: s for s in (self.last_stocks or [])}
+        for i, code in enumerate(self.codes):
+            s = by_code.get(code, {"code": code, "price": None})  # chưa fetch -> '—'
             row = NSStackView.alloc().initWithFrame_(NSMakeRect(0, 0, 10, 10))
             row.setOrientation_(NSUserInterfaceLayoutOrientationHorizontal)
             row.setSpacing_(8.0)
@@ -311,8 +333,7 @@ class StockBarApp(NSObject):
             )
 
     def onRefresh_(self, sender):
-        self.refresh_(None)
-        self._rebuild_panel()  # cập nhật panel ngay
+        self.refresh_(None)  # fetch nền; thread xong tự rebuild panel
 
     def onQuit_(self, sender):
         NSApplication.sharedApplication().terminate_(sender)
@@ -334,11 +355,11 @@ class StockBarApp(NSObject):
             self._apply_watchlist_change()
 
     def _apply_watchlist_change(self):
-        """Ghi config.json + fetch giá mới ngay + dựng lại panel."""
+        """Ghi config.json + rebuild ngay (phản hồi tức thì) + fetch mã mới ở nền."""
         self.cfg["watchlist"] = self.codes
         save_config(self.cfg)
-        self.refresh_(None)  # fetch mã mới (bên trong tự rebuild nếu popover mở)
-        self._rebuild_panel()
+        self._rebuild_panel()  # hiện ngay list mới (mã mới = '—' tới khi fetch xong)
+        self.refresh_(None)    # fetch nền, xong tự rebuild lại
 
 
 if __name__ == "__main__":
