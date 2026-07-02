@@ -3,9 +3,12 @@
     "GMD",
     "HPG",
     "SHS",
-    "TPB",
-    "DGW",
-    "MSN"
+    "DPM",
+    "DCM",
+    "VIC",
+    "VHM",
+    "VRE",
+    "HPD"
   ],
   "refresh_seconds": 30
 }
