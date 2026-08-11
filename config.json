@@ -1,14 +1,17 @@
 {
   "watchlist": [
-    "GMD",
-    "HPG",
     "SHS",
-    "DPM",
-    "DCM",
     "VIC",
     "VHM",
-    "VRE",
-    "HPD"
+    "CEO"
   ],
-  "refresh_seconds": 30
+  "refresh_seconds": 30,
+  "targets": {
+    "SHS": 17.4,
+    "CEO": 12.3
+  },
+  "quantities": {
+    "SHS": 1200,
+    "CEO": 200
+  }
 }

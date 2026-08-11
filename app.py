@@ -25,6 +25,7 @@ from AppKit import (
     NSRectEdgeMaxY,
     NSStackView,
     NSStatusBar,
+    NSTextAlignmentRight,
     NSTextField,
     NSUserInterfaceLayoutOrientationHorizontal,
     NSUserInterfaceLayoutOrientationVertical,
@@ -37,6 +38,7 @@ from Foundation import NSObject
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 API_URL = "https://api-finfo.vndirect.com.vn/v4/stock_prices"
+INDEX_API_URL = "https://api-finfo.vndirect.com.vn/v4/vnmarket_prices"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
@@ -60,6 +62,8 @@ def load_config():
         cfg = json.load(f)
     cfg.setdefault("watchlist", ["HPG"])
     cfg.setdefault("refresh_seconds", 30)
+    cfg.setdefault("targets", {})     # {code: giá mua} user tự note
+    cfg.setdefault("quantities", {})  # {code: số cp đã mua} để tính lãi/lỗ
     return cfg
 
 
@@ -73,15 +77,48 @@ def normalize_code(raw):
     return (raw or "").strip().upper()
 
 
-def fetch_one(code):
-    """Lấy dòng giá mới nhất (ngày gần nhất) của 1 mã.
+def fetch_one(code, history=21):
+    """Lấy giá mã + volume trung bình để so vol hôm nay cao/thấp.
 
-    Dùng stock_prices?sort=date:desc&size=1 để có close (giá hiện tại),
-    basicPrice (tham chiếu) và pctChange (% thay đổi TRONG NGÀY).
-    Raise nếu network/API lỗi — caller tự bắt.
+    history phiên gần nhất (date:desc): phiên [0] = mới nhất (giá hiện tại),
+    [1:] = lịch sử -> tính avgVolume so với vol hôm nay. Dùng history=1 khi
+    chỉ cần kiểm tra mã tồn tại (validate). Raise nếu network/API lỗi.
     """
     resp = requests.get(
         API_URL,
+        params={"sort": "date:desc", "q": f"code:{code}", "size": history},
+        headers=HEADERS,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    if not data:
+        return {"code": code, "price": None}
+    row = data[0]
+    # avgVolume = TB các phiên TRƯỚC hôm nay (bỏ [0] đang chạy dở trong phiên).
+    hist_vols = [r.get("nmVolume") for r in data[1:] if r.get("nmVolume")]
+    avg_vol = sum(hist_vols) / len(hist_vols) if hist_vols else None
+    return {
+        "code": code,
+        "price": row.get("close"),
+        "change": row.get("change"),
+        "changePct": row.get("pctChange"),
+        "ceiling": row.get("ceilingPrice"),
+        "floor": row.get("floorPrice"),
+        "ref": row.get("basicPrice"),
+        "volume": row.get("nmVolume"),
+        "avgVolume": avg_vol,
+    }
+
+
+def fetch_index(code="VNINDEX"):
+    """Lấy điểm chỉ số (VN-Index) mới nhất từ endpoint vnmarket_prices.
+
+    Index không nằm trong stock_prices; endpoint riêng trả close/change/pctChange.
+    Raise nếu network/API lỗi — caller tự bắt.
+    """
+    resp = requests.get(
+        INDEX_API_URL,
         params={"sort": "date:desc", "q": f"code:{code}", "size": 1},
         headers=HEADERS,
         timeout=10,
@@ -96,10 +133,6 @@ def fetch_one(code):
         "price": row.get("close"),
         "change": row.get("change"),
         "changePct": row.get("pctChange"),
-        "ceiling": row.get("ceilingPrice"),
-        "floor": row.get("floorPrice"),
-        "ref": row.get("basicPrice"),
-        "volume": row.get("nmVolume"),
     }
 
 
@@ -148,30 +181,66 @@ def format_volume(vol):
 
 
 def format_row(stock):
-    """1 mã -> (text, chg_start, chg_len).
+    """1 mã -> (text, chg_start, chg_len, vol_start, vol_len).
 
-    chg_start/chg_len = vị trí đoạn '▲+2.99%' để tô màu riêng; phần còn lại
-    (mã, giá, volume) để labelColor cho rõ. VD: 'HPG   23.45  ▲+2.99%   13.9M'.
+    chg = đoạn '▲+2.99%' tô màu status; vol = đoạn khối lượng tô màu cao/thấp.
+    Phần còn lại (mã, giá) để đen cho rõ. VD: 'HPG   23.45  ▲+2.99%   13.9M'.
     """
     code = stock["code"]
     price = stock.get("price")
     if price is None:
         text = f"{code:<5} —"
-        return text, 0, 0
+        return text, 0, 0, 0, 0
     change = stock.get("change") or 0.0
     pct = stock.get("changePct") or 0.0
     arrow = "▲" if change > 0 else ("▼" if change < 0 else "—")
     sign = "+" if change > 0 else ""
-    vol = format_volume(stock.get("volume"))
+    vol = f"{format_volume(stock.get('volume')):>6}"
     chg = f"{arrow}{sign}{pct:.2f}%"
     prefix = f"{code:<5} {price:>7.2f}  "
-    text = f"{prefix}{chg}   {vol:>6}"
-    return text, len(prefix), len(chg)
+    mid = f"{prefix}{chg}   "
+    text = f"{mid}{vol}"
+    return text, len(prefix), len(chg), len(mid), len(vol)
+
+
+def format_target_diff(price, target):
+    """% chênh giá hiện tại so giá đối chiếu -> (text, status_key), hoặc None.
+
+    price > target -> 'up' (đang cao hơn giá định vào), < -> 'down'. VD '+4.1%'.
+    """
+    if price is None or not target:
+        return None
+    pct = (price - target) / target * 100
+    sign = "+" if pct > 0 else ""
+    key = "up" if pct > 0 else ("down" if pct < 0 else "ref")
+    return f"{sign}{pct:.1f}%", key
 
 
 ROW_FONT_SIZE = 13.0
 BLACK = NSColor.blackColor
-GRAY = lambda: _rgb(0.45, 0.45, 0.45)  # volume xám nhạt
+GRAY = lambda: _rgb(0.45, 0.45, 0.45)  # volume bình thường: xám
+
+# Màu volume theo tỉ lệ vol hôm nay / TB 20 phiên.
+VOL_HIGH = lambda: _rgb(1.00, 0.50, 0.05)  # cao đột biến: cam đậm (có sóng)
+VOL_LOW = lambda: _rgb(0.62, 0.70, 0.78)   # thấp: xám xanh nhạt (èo uột)
+VOL_HIGH_RATIO = 1.5
+VOL_LOW_RATIO = 0.5
+
+
+def volume_color(stock):
+    """Màu đoạn volume: cam nếu vol hôm nay cao đột biến so TB, xám xanh nếu thấp.
+
+    Không có avgVolume (mã mới / chưa đủ lịch sử) -> xám thường.
+    """
+    vol, avg = stock.get("volume"), stock.get("avgVolume")
+    if not vol or not avg:
+        return GRAY()
+    ratio = vol / avg
+    if ratio >= VOL_HIGH_RATIO:
+        return VOL_HIGH()
+    if ratio <= VOL_LOW_RATIO:
+        return VOL_LOW()
+    return GRAY()
 
 
 def _mono(size=ROW_FONT_SIZE, weight=0.4):
@@ -179,11 +248,11 @@ def _mono(size=ROW_FONT_SIZE, weight=0.4):
 
 
 def make_row_label(stock):
-    """1 mã -> NSTextField: mã/giá/volume ĐEN đậm, chỉ đoạn %[chg] tô màu status.
+    """1 mã -> NSTextField: mã/giá ĐEN, đoạn %[chg] tô status, đoạn volume tô cao/thấp.
 
     Dùng monospaced font để mọi cột thẳng hàng (width cố định theo dòng dài nhất).
     """
-    text, chg_start, chg_len = format_row(stock)
+    text, chg_start, chg_len, vol_start, vol_len = format_row(stock)
     astr = NSMutableAttributedString.alloc().initWithString_(text)
     astr.addAttribute_value_range_(NSFontAttributeName, _mono(), (0, len(text)))
     astr.addAttribute_value_range_(
@@ -195,6 +264,10 @@ def make_row_label(stock):
             STATUS_COLORS[price_status(stock)](),
             (chg_start, chg_len),
         )
+    if vol_len:
+        astr.addAttribute_value_range_(
+            NSForegroundColorAttributeName, volume_color(stock), (vol_start, vol_len)
+        )
     return NSTextField.labelWithAttributedString_(astr)
 
 
@@ -202,6 +275,92 @@ def make_text_label(text, color, weight=0.4):
     astr = NSMutableAttributedString.alloc().initWithString_(text)
     astr.addAttribute_value_range_(NSFontAttributeName, _mono(weight=weight), (0, len(text)))
     astr.addAttribute_value_range_(NSForegroundColorAttributeName, color, (0, len(text)))
+    return NSTextField.labelWithAttributedString_(astr)
+
+
+def make_index_label(index):
+    """VN-Index -> NSTextField 1 dòng nổi bật: 'VN-Index 1838.86  ▼-1.84 -0.10%'.
+
+    Nhãn 'VN-Index' + điểm số để ĐEN đậm; đoạn change/% tô xanh(tăng)/đỏ(giảm).
+    """
+    price = index.get("price")
+    if price is None:
+        astr = NSMutableAttributedString.alloc().initWithString_("VN-Index —")
+        astr.addAttribute_value_range_(NSFontAttributeName, _mono(weight=0.6), (0, 10))
+        astr.addAttribute_value_range_(NSForegroundColorAttributeName, BLACK(), (0, 10))
+        return NSTextField.labelWithAttributedString_(astr)
+
+    change = index.get("change") or 0.0
+    pct = index.get("changePct") or 0.0
+    arrow = "▲" if change > 0 else ("▼" if change < 0 else "—")
+    sign = "+" if change > 0 else ""
+    prefix = f"VN-Index {price:>8.2f}  "
+    chg = f"{arrow}{sign}{change:.2f} {sign}{pct:.2f}%"
+    text = f"{prefix}{chg}"
+
+    astr = NSMutableAttributedString.alloc().initWithString_(text)
+    astr.addAttribute_value_range_(NSFontAttributeName, _mono(weight=0.6), (0, len(text)))
+    astr.addAttribute_value_range_(NSForegroundColorAttributeName, BLACK(), (0, len(text)))
+    color = STATUS_COLORS["up"]() if change > 0 else (
+        STATUS_COLORS["down"]() if change < 0 else STATUS_COLORS["ref"]()
+    )
+    astr.addAttribute_value_range_(
+        NSForegroundColorAttributeName, color, (len(prefix), len(chg))
+    )
+    return NSTextField.labelWithAttributedString_(astr)
+
+
+def format_money(v):
+    """Số tiền (đơn vị NGHÌN đồng, = giá[nghìn] × số cp) -> gọn: 1.52 tỷ / 152.3tr / 850k."""
+    a = abs(v)
+    if a >= 1_000_000:  # >= 1 tỷ (1e6 nghìn đồng)
+        return f"{v / 1_000_000:.2f} tỷ"
+    if a >= 1_000:      # >= 1 triệu
+        return f"{v / 1_000:.1f}tr"
+    return f"{v:.0f}k"
+
+
+def portfolio_totals(codes, targets, quantities, by_code):
+    """Tổng danh mục từ các mã có ĐỦ giá mua + vol + giá hiện tại. None nếu chưa có mã nào.
+
+    Đơn vị tiền = nghìn đồng (giá VNDirect là nghìn đồng, qty là số cp).
+    nav = Σ giá_hiện_tại × qty; cost = Σ giá_mua × qty; pnl = nav - cost.
+    """
+    cost = nav = 0.0
+    counted = 0
+    for code in codes:
+        t, q = targets.get(code), quantities.get(code)
+        price = (by_code.get(code) or {}).get("price")
+        if not t or not q or price is None:
+            continue
+        counted += 1
+        cost += t * q
+        nav += price * q
+    if not counted:
+        return None
+    pnl = nav - cost
+    pct = (pnl / cost * 100) if cost else 0.0
+    return {"nav": nav, "cost": cost, "pnl": pnl, "pct": pct, "count": counted}
+
+
+def make_total_label(totals):
+    """Hàng tổng: 'TỔNG  152.3tr  ▲+5.2tr +3.5%'. Nhãn+NAV đen, đoạn lãi/lỗ tô xanh/đỏ."""
+    nav, pnl, pct = totals["nav"], totals["pnl"], totals["pct"]
+    arrow = "▲" if pnl > 0 else ("▼" if pnl < 0 else "—")
+    sign = "+" if pnl > 0 else ""
+    prefix = f"TỔNG  {format_money(nav)}   "
+    chg = f"{arrow}{sign}{format_money(pnl)} {sign}{pct:.1f}%"
+    text = f"{prefix}{chg}"
+
+    astr = NSMutableAttributedString.alloc().initWithString_(text)
+    astr.addAttribute_value_range_(NSFontAttributeName, _mono(weight=0.6), (0, len(text)))
+    astr.addAttribute_value_range_(NSForegroundColorAttributeName, BLACK(), (0, len(text)))
+    color = STATUS_COLORS["up"]() if pnl > 0 else (
+        STATUS_COLORS["down"]() if pnl < 0 else STATUS_COLORS["ref"]()
+    )
+    astr.addAttribute_value_range_(
+        NSForegroundColorAttributeName, color, (len(prefix), len(chg))
+    )
     return NSTextField.labelWithAttributedString_(astr)
 
 
@@ -214,7 +373,10 @@ class StockBarApp(NSObject):
             return None
         self.cfg = load_config()
         self.codes = self.cfg["watchlist"]
+        self.targets = self.cfg["targets"]
+        self.quantities = self.cfg["quantities"]
         self.last_stocks = None
+        self.last_index = None
 
         # Status item + icon topbar; click button -> toggle popover.
         self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
@@ -240,8 +402,18 @@ class StockBarApp(NSObject):
     def _fetch_bg(self, codes):
         now = datetime.now().strftime("%H:%M:%S")
         try:
-            stocks = fetch_prices(codes)
-            result = {"stocks": stocks, "status": f"Cập nhật: {now}", "ok": True}
+            # Index + watchlist fetch song song để không cộng dồn latency.
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fut_index = ex.submit(fetch_index)
+                fut_stocks = ex.submit(fetch_prices, codes)
+                index = fut_index.result()
+                stocks = fut_stocks.result()
+            result = {
+                "stocks": stocks,
+                "index": index,
+                "status": f"Cập nhật: {now}",
+                "ok": True,
+            }
         except Exception:
             result = {"status": f"⚠️ Không cập nhật được ({now})", "ok": False}
         # AppKit: mọi update UI phải về main thread.
@@ -252,6 +424,7 @@ class StockBarApp(NSObject):
     def _applyFetchResult_(self, result):
         if result["ok"]:
             self.last_stocks = result["stocks"]
+            self.last_index = result["index"]
             self.status_item.button().setTitle_("📈")
         else:
             self.status_item.button().setTitle_("⚠️")
@@ -266,6 +439,11 @@ class StockBarApp(NSObject):
         stack.setAlignment_(NSLayoutAttributeLeading)
         stack.setSpacing_(5.0)
 
+        # VN-Index trên cùng — '—' tới khi fetch xong lần đầu.
+        stack.addArrangedSubview_(
+            make_index_label(self.last_index or {"code": "VNINDEX", "price": None})
+        )
+
         # Iterate theo self.codes (nguồn chân lý) để tag nút ✕ = index trong codes,
         # tránh lệch khi fetch nền chưa kịp cập nhật last_stocks sau Add/Remove.
         by_code = {s["code"]: s for s in (self.last_stocks or [])}
@@ -275,11 +453,38 @@ class StockBarApp(NSObject):
             row.setOrientation_(NSUserInterfaceLayoutOrientationHorizontal)
             row.setSpacing_(8.0)
             row.addArrangedSubview_(make_row_label(s))
+
+            # Ô nhập giá mua + vol đã mua (tag=index để handler map ra code).
+            target = self.targets.get(code)
+            qty = self.quantities.get(code)
+            row.addArrangedSubview_(self._row_input(
+                i, f"{target:g}" if target is not None else "", "giá", 56.0,
+                "onTargetChanged:",
+            ))
+            row.addArrangedSubview_(self._row_input(
+                i, f"{qty}" if qty else "", "vol", 66.0, "onQtyChanged:",
+            ))
+
+            # % chênh giá hiện tại so target. Luôn add (rỗng nếu chưa có target) +
+            # ghim width để cột ✕ thẳng hàng giữa mọi row.
+            diff = format_target_diff(s.get("price"), target)
+            diff_text = diff[0] if diff else ""
+            diff_color = STATUS_COLORS[diff[1]]() if diff else GRAY()
+            diff_lbl = make_text_label(diff_text, diff_color, weight=0.5)
+            diff_lbl.setAlignment_(NSTextAlignmentRight)
+            diff_lbl.widthAnchor().constraintEqualToConstant_(54.0).setActive_(True)
+            row.addArrangedSubview_(diff_lbl)
+
             x_btn = NSButton.buttonWithTitle_target_action_("✕", self, "onRemove:")
             x_btn.setTag_(i)
             x_btn.setBezelStyle_(0)  # bezel gọn
             row.addArrangedSubview_(x_btn)
             stack.addArrangedSubview_(row)
+
+        # Hàng tổng danh mục — chỉ hiện khi có mã nhập đủ giá mua + vol.
+        totals = portfolio_totals(self.codes, self.targets, self.quantities, by_code)
+        if totals:
+            stack.addArrangedSubview_(make_total_label(totals))
 
         stack.addArrangedSubview_(
             make_text_label(getattr(self, "status_text", ""), GRAY(), weight=0.3)
@@ -324,6 +529,17 @@ class StockBarApp(NSObject):
         vc.setView_(view)
         self.popover.setContentViewController_(vc)
         self.popover.setContentSize_((fit.width + 2 * pad, fit.height + 2 * pad))
+        # Rebuild lúc popover đang mở (fetch nền xong) sẽ set content view mới ->
+        # window auto-focus lại ô nhập; clear để không nhảy con trỏ vào ô giá.
+        if self.popover.isShown():
+            self._clear_focus()
+
+    def _clear_focus(self):
+        """Bỏ first responder để popover mở ra không tự focus/select ô nhập nào."""
+        vc = self.popover.contentViewController()
+        win = vc.view().window() if vc is not None else None
+        if win is not None:
+            win.makeFirstResponder_(None)
 
     def togglePopover_(self, sender):
         if self.popover.isShown():
@@ -334,6 +550,7 @@ class StockBarApp(NSObject):
             self.popover.showRelativeToRect_ofView_preferredEdge_(
                 btn.bounds(), btn, NSRectEdgeMaxY
             )
+            self._clear_focus()  # mở panel = không focus ô nào
 
     def onRefresh_(self, sender):
         self.refresh_(None)  # fetch nền; thread xong tự rebuild panel
@@ -358,7 +575,7 @@ class StockBarApp(NSObject):
 
     def _validate_bg(self, code):
         try:
-            valid = fetch_one(code).get("price") is not None
+            valid = fetch_one(code, history=1).get("price") is not None
         except Exception:
             valid = False  # lỗi mạng coi như chưa xác thực được -> báo lỗi
         self.performSelectorOnMainThread_withObject_waitUntilDone_(
@@ -376,11 +593,15 @@ class StockBarApp(NSObject):
         self._apply_watchlist_change()
 
     def _warn_invalid_input(self):
-        """Ô nhập viền đỏ + rung để báo mã không hợp lệ."""
-        layer = self.input_field.layer()
+        """Ô thêm mã: viền đỏ + rung báo mã không hợp lệ."""
+        self._shake_field(self.input_field)
+
+    def _shake_field(self, field):
+        """Tô viền đỏ + rung 1 NSTextField bất kỳ để báo input sai."""
+        layer = field.layer()
         layer.setBorderColor_(NSColor.systemRedColor().CGColor())
         layer.setBorderWidth_(2.0)
-        f = self.input_field.frame()
+        f = field.frame()
         cx = f.origin.x + f.size.width / 2
         shake = CAKeyframeAnimation.animationWithKeyPath_("position.x")
         shake.setValues_([cx, cx - 6, cx + 6, cx - 4, cx + 4, cx])
@@ -390,12 +611,88 @@ class StockBarApp(NSObject):
     def onRemove_(self, sender):
         i = sender.tag()
         if 0 <= i < len(self.codes):
+            code = self.codes[i]
             del self.codes[i]
+            self.targets.pop(code, None)     # xoá mã thì bỏ luôn giá mua...
+            self.quantities.pop(code, None)  # ...và vol đã mua
             self._apply_watchlist_change()
+
+    def _row_input(self, i, value, placeholder, width, action):
+        """1 ô nhập nhỏ trong row (giá mua / vol). tag=index để handler map ra code."""
+        f = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, width, 22))
+        f.setEditable_(True)
+        f.setAlignment_(NSTextAlignmentRight)
+        f.setFont_(_mono(size=12.0))
+        f.setPlaceholderString_(placeholder)
+        if value:
+            f.setStringValue_(value)
+        f.setTag_(i)
+        f.setTarget_(self)
+        f.setAction_(action)  # Enter/end-edit = lưu
+        f.setWantsLayer_(True)
+        f.layer().setCornerRadius_(4.0)
+        # Ghim width: NSTextField editable compression resistance thấp, cạnh label
+        # khác nó bị nén về ~0 -> ẩn. Constraint ép width cố định.
+        f.widthAnchor().constraintEqualToConstant_(width).setActive_(True)
+        return f
+
+    # --- giá mua / vol đã mua ---
+    def onTargetChanged_(self, sender):
+        """Enter trong ô giá mua -> parse + lưu. Rỗng = xoá."""
+        i = sender.tag()
+        if not (0 <= i < len(self.codes)):
+            return
+        code = self.codes[i]
+        raw = sender.stringValue().strip().replace(",", ".")
+        if not raw:
+            self.targets.pop(code, None)
+            self._apply_portfolio_change()
+            return
+        try:
+            val = float(raw)
+        except ValueError:
+            self._shake_field(sender)
+            return
+        if val <= 0:
+            self._shake_field(sender)
+            return
+        self.targets[code] = val
+        self._apply_portfolio_change()
+
+    def onQtyChanged_(self, sender):
+        """Enter trong ô vol đã mua -> parse số nguyên cp + lưu. Rỗng = xoá."""
+        i = sender.tag()
+        if not (0 <= i < len(self.codes)):
+            return
+        code = self.codes[i]
+        raw = sender.stringValue().strip().replace(",", "").replace(".", "")  # bỏ phân cách nghìn
+        if not raw:
+            self.quantities.pop(code, None)
+            self._apply_portfolio_change()
+            return
+        try:
+            qty = int(raw)
+        except ValueError:
+            self._shake_field(sender)
+            return
+        if qty <= 0:
+            self._shake_field(sender)
+            return
+        self.quantities[code] = qty
+        self._apply_portfolio_change()
+
+    def _apply_portfolio_change(self):
+        """Ghi giá mua + vol vào config + rebuild để cập nhật % chênh & hàng tổng."""
+        self.cfg["targets"] = self.targets
+        self.cfg["quantities"] = self.quantities
+        save_config(self.cfg)
+        self._rebuild_panel()
 
     def _apply_watchlist_change(self):
         """Ghi config.json + rebuild ngay (phản hồi tức thì) + fetch mã mới ở nền."""
         self.cfg["watchlist"] = self.codes
+        self.cfg["targets"] = self.targets
+        self.cfg["quantities"] = self.quantities
         save_config(self.cfg)
         self._rebuild_panel()  # hiện ngay list mới (mã mới = '—' tới khi fetch xong)
         self.refresh_(None)    # fetch nền, xong tự rebuild lại
