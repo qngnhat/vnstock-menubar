@@ -58,8 +58,11 @@ STATUS_COLORS = {
 
 
 def load_config():
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        cfg = json.load(f)
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        cfg = {}  # chưa có config (clone mới) -> dựng từ default; save_config sẽ tạo file
     cfg.setdefault("watchlist", ["HPG"])
     cfg.setdefault("refresh_seconds", 30)
     cfg.setdefault("targets", {})     # {code: giá mua} user tự note
