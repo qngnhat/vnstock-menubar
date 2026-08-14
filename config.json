@@ -3,7 +3,8 @@
     "SHS",
     "VIC",
     "VHM",
-    "CEO"
+    "CEO",
+    "VIX"
   ],
   "refresh_seconds": 30,
   "targets": {
@@ -11,7 +12,7 @@
     "CEO": 12.3
   },
   "quantities": {
-    "SHS": 1300,
+    "SHS": 1000,
     "CEO": 200
   }
 }
