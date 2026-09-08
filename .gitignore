@@ -6,3 +6,4 @@ venv/
 # Data/state cá nhân — không commit
 config.json
 *.log
+.app.pid
