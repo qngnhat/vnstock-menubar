@@ -67,6 +67,8 @@ def load_config():
     cfg.setdefault("refresh_seconds", 30)
     cfg.setdefault("targets", {})     # {code: giá mua} user tự note
     cfg.setdefault("quantities", {})  # {code: số cp đã mua} để tính lãi/lỗ
+    cfg.setdefault("dates", {})       # {code: "YYYY-MM-DD"} đóng dấu lúc vào vị thế -> bot tính T+
+    cfg.setdefault("sync", {})        # {url, key} đẩy danh mục lên bot; thiếu = tắt sync
     return cfg
 
 
@@ -346,6 +348,60 @@ def portfolio_totals(codes, targets, quantities, by_code):
     return {"nav": nav, "cost": cost, "pnl": pnl, "pct": pct, "count": counted}
 
 
+def build_holdings(targets, quantities, dates):
+    """Snapshot vị thế để đẩy lên bot. Chỉ mã có ĐỦ giá vốn + vol mới là vị thế:
+    mã chỉ ghi giá mà không ghi vol là đang ngắm, không phải đang cầm."""
+    out = []
+    for code in sorted(targets):
+        t, q = targets.get(code), quantities.get(code)
+        if not t or not q:
+            continue
+        out.append({
+            "symbol": code,
+            "avg_cost": t,
+            "qty": q,
+            "first_buy_date": dates.get(code),
+        })
+    return out
+
+
+def stamp_dates(targets, quantities, dates, today):
+    """Đủ giá vốn + vol lần đầu = vào vị thế -> đóng dấu ngày, bot lấy tính T+.
+    Bỏ giá hoặc vol = thoát -> xoá dấu, lần mua sau đếm lại từ đầu.
+    Sửa `dates` tại chỗ vì cfg["dates"] và self.dates là cùng một object."""
+    for code in list(dates):
+        if not targets.get(code) or not quantities.get(code):
+            del dates[code]
+    for code, t in targets.items():
+        if t and quantities.get(code) and code not in dates:
+            dates[code] = today
+    return dates
+
+
+def push_holdings(sync_cfg, holdings):
+    """POST snapshot lên worker (replace-all bên đó).
+
+    Nuốt mọi lỗi: mất mạng không được làm kẹt app, và lần sửa sau sẽ tự đẩy lại
+    nguyên snapshot nên không có chuyện lệch tích luỹ.
+    """
+    url = (sync_cfg or {}).get("url")
+    key = (sync_cfg or {}).get("key")
+    if not url or not key:
+        return
+    try:
+        resp = requests.post(
+            url, params={"key": key}, json={"holdings": holdings}, timeout=10
+        )
+        # flush: nohup redirect stdout vào file -> print bị buffer, log sync tới
+        # lúc cần soi thì chưa ra tới nơi.
+        if resp.status_code == 200:
+            print(f"[sync] ok {len(holdings)} mã", flush=True)
+        else:
+            print(f"[sync] HTTP {resp.status_code}: {resp.text[:200]}", flush=True)
+    except requests.RequestException as e:
+        print(f"[sync] lỗi mạng: {e}", flush=True)
+
+
 def make_total_label(totals):
     """Hàng tổng: 'TỔNG  152.3tr  ▲+5.2tr +3.5%'. Nhãn+NAV đen, đoạn lãi/lỗ tô xanh/đỏ."""
     nav, pnl, pct = totals["nav"], totals["pnl"], totals["pct"]
@@ -378,6 +434,7 @@ class StockBarApp(NSObject):
         self.codes = self.cfg["watchlist"]
         self.targets = self.cfg["targets"]
         self.quantities = self.cfg["quantities"]
+        self.dates = self.cfg["dates"]
         self.last_stocks = None
         self.last_index = None
 
@@ -394,6 +451,11 @@ class StockBarApp(NSObject):
         self.popover.setBehavior_(NSPopoverBehaviorTransient)  # click ngoài -> đóng
 
         self.refresh_(None)  # fetch 1 lần lúc mở; sau đó chỉ fetch khi bấm Refresh
+        # Đẩy 1 lần lúc mở: danh mục có thể đã đổi ở lần chạy trước mà push hỏng,
+        # hoặc bảng bên bot vừa được tạo lại.
+        self._stamp_dates()
+        save_config(self.cfg)
+        self._sync_bg()
         return self
 
     # --- data ---
@@ -684,21 +746,37 @@ class StockBarApp(NSObject):
         self.quantities[code] = qty
         self._apply_portfolio_change()
 
+    def _stamp_dates(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        stamp_dates(self.targets, self.quantities, self.dates, today)
+        self.cfg["dates"] = self.dates
+
+    def _sync_bg(self):
+        """Đẩy nền: POST mạng mà chạy trên main thread thì panel đứng hình."""
+        holdings = build_holdings(self.targets, self.quantities, self.dates)
+        threading.Thread(
+            target=push_holdings, args=(self.cfg.get("sync"), holdings), daemon=True
+        ).start()
+
     def _apply_portfolio_change(self):
         """Ghi giá mua + vol vào config + rebuild để cập nhật % chênh & hàng tổng."""
         self.cfg["targets"] = self.targets
         self.cfg["quantities"] = self.quantities
+        self._stamp_dates()
         save_config(self.cfg)
         self._rebuild_panel()
+        self._sync_bg()
 
     def _apply_watchlist_change(self):
         """Ghi config.json + rebuild ngay (phản hồi tức thì) + fetch mã mới ở nền."""
         self.cfg["watchlist"] = self.codes
         self.cfg["targets"] = self.targets
         self.cfg["quantities"] = self.quantities
+        self._stamp_dates()
         save_config(self.cfg)
         self._rebuild_panel()  # hiện ngay list mới (mã mới = '—' tới khi fetch xong)
         self.refresh_(None)    # fetch nền, xong tự rebuild lại
+        self._sync_bg()
 
 
 if __name__ == "__main__":
