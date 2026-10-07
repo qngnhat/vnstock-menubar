@@ -27,6 +27,7 @@ from AppKit import (
     NSStatusBar,
     NSTextAlignmentRight,
     NSTextField,
+    NSTextView,
     NSUserInterfaceLayoutOrientationHorizontal,
     NSUserInterfaceLayoutOrientationVertical,
     NSVariableStatusItemLength,
@@ -39,6 +40,13 @@ from Foundation import NSObject
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 API_URL = "https://api-finfo.vndirect.com.vn/v4/stock_prices"
 INDEX_API_URL = "https://api-finfo.vndirect.com.vn/v4/vnmarket_prices"
+# Bảng giá VPS = giá khớp realtime; VNDirect stock_prices là snapshot ~1 phút/lần
+# nên trễ 1-2 phút. VNDirect giữ làm fallback + nguồn avgVolume lịch sử.
+LIVE_API_URL = "https://bgapidatafeed.vps.com.vn/getliststockdata/"
+LIVE_INDEX_URL = "https://bgapidatafeed.vps.com.vn/getlistindexdetail/10"  # 10 = VNINDEX
+# DNS VPS trả 2 IP, IP đầu (13.250.167.163) chết: connect timeout ngắn để urllib3
+# bỏ nhanh sang IP sau, không thì mỗi lần fetch treo 10-15s.
+LIVE_TIMEOUT = (1.0, 5)
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
@@ -116,12 +124,67 @@ def fetch_one(code, history=21):
     }
 
 
-def fetch_index(code="VNINDEX"):
-    """Lấy điểm chỉ số (VN-Index) mới nhất từ endpoint vnmarket_prices.
+def fetch_live(codes):
+    """Giá realtime nhiều mã trong 1 request từ bảng giá VPS -> {code: dict}.
 
-    Index không nằm trong stock_prices; endpoint riêng trả close/change/pctChange.
-    Raise nếu network/API lỗi — caller tự bắt.
+    Mã VPS không biết thì không có trong kết quả. Raise nếu network/API lỗi.
     """
+    resp = requests.get(
+        LIVE_API_URL + ",".join(codes), headers=HEADERS, timeout=LIVE_TIMEOUT
+    )
+    resp.raise_for_status()
+    out = {}
+    for r in resp.json():
+        ref = r.get("r")
+        if not ref:
+            continue
+        # lastPrice = 0 khi chưa khớp lệnh nào trong ngày (trước phiên / ATO).
+        price = r.get("lastPrice") or ref
+        # changePc của VPS không có dấu -> tự tính change từ ref.
+        change = round(price - ref, 2)
+        out[r["sym"]] = {
+            "code": r["sym"],
+            "price": price,
+            "change": change,
+            "changePct": change / ref * 100,
+            "ceiling": r.get("c"),
+            "floor": r.get("f"),
+            "ref": ref,
+            "volume": (r.get("lot") or 0) * 10,  # lot = đơn vị 10 cp
+        }
+    return out
+
+
+_avg_volume_cache = {}  # {(code, ngày): avgVolume} — TB 20 phiên trước, trong ngày không đổi
+
+
+def avg_volume(code):
+    key = (code, datetime.now().date())
+    if key not in _avg_volume_cache:
+        _avg_volume_cache[key] = fetch_one(code).get("avgVolume")
+    return _avg_volume_cache[key]
+
+
+def fetch_index(code="VNINDEX"):
+    """Lấy điểm VN-Index: bảng giá VPS (realtime), lỗi thì fallback vnmarket_prices.
+
+    Raise nếu cả 2 nguồn lỗi — caller tự bắt.
+    """
+    try:
+        resp = requests.get(LIVE_INDEX_URL, headers=HEADERS, timeout=LIVE_TIMEOUT)
+        resp.raise_for_status()
+        row = (resp.json() or [None])[0]
+        if row and row.get("cIndex") and row.get("oIndex"):
+            price, ref = row["cIndex"], row["oIndex"]
+            change = round(price - ref, 2)
+            return {
+                "code": code,
+                "price": price,
+                "change": change,
+                "changePct": change / ref * 100,
+            }
+    except (requests.RequestException, ValueError) as e:
+        print(f"[live] index lỗi, fallback VNDirect: {e}", flush=True)
     resp = requests.get(
         INDEX_API_URL,
         params={"sort": "date:desc", "q": f"code:{code}", "size": 1},
@@ -142,15 +205,31 @@ def fetch_index(code="VNINDEX"):
 
 
 def fetch_prices(codes):
-    """Lấy giá các mã SONG SONG, giữ đúng thứ tự. Trả list dict.
+    """Lấy giá các mã, giữ đúng thứ tự. Trả list dict.
 
-    ThreadPoolExecutor.map giữ order theo input; song song ~3x nhanh hơn tuần tự
-    (mỗi mã 1 HTTP ~300ms, 5 mã tuần tự 1.3s -> song song ~0.4s).
+    Giá từ VPS (1 request cho cả list); mã VPS thiếu hoặc VPS lỗi thì fallback
+    fetch_one VNDirect từng mã. Song song vì fallback/avgVolume là 1 HTTP mỗi mã.
     """
     if not codes:
         return []
+    try:
+        live = fetch_live(codes)
+    except (requests.RequestException, ValueError) as e:
+        print(f"[live] lỗi, fallback VNDirect: {e}", flush=True)
+        live = {}
+
+    def one(code):
+        stock = live.get(code)
+        if stock is None:
+            return fetch_one(code)
+        try:
+            stock["avgVolume"] = avg_volume(code)
+        except requests.RequestException:
+            stock["avgVolume"] = None  # thiếu avg chỉ mất màu volume, giá vẫn hiện
+        return stock
+
     with ThreadPoolExecutor(max_workers=min(len(codes), 8)) as ex:
-        return list(ex.map(fetch_one, codes))
+        return list(ex.map(one, codes))
 
 
 def price_status(stock):
@@ -450,7 +529,7 @@ class StockBarApp(NSObject):
         self.popover = NSPopover.alloc().init()
         self.popover.setBehavior_(NSPopoverBehaviorTransient)  # click ngoài -> đóng
 
-        self.refresh_(None)  # fetch 1 lần lúc mở; sau đó chỉ fetch khi bấm Refresh
+        self.refresh_(None)  # fetch 1 lần lúc mở; sau đó fetch khi mở panel hoặc bấm Refresh
         # Đẩy 1 lần lúc mở: danh mục có thể đã đổi ở lần chạy trước mà push hỏng,
         # hoặc bảng bên bot vừa được tạo lại.
         self._stamp_dates()
@@ -494,7 +573,8 @@ class StockBarApp(NSObject):
         else:
             self.status_item.button().setTitle_("⚠️")
         self.status_text = result["status"]
-        if self.popover.isShown():
+        # Đang gõ dở ô nào thì rebuild sẽ xoá mất chữ -> để lần rebuild sau mới hiện giá mới.
+        if self.popover.isShown() and not self._is_editing():
             self._rebuild_panel()
 
     # --- UI ---
@@ -606,10 +686,17 @@ class StockBarApp(NSObject):
         if win is not None:
             win.makeFirstResponder_(None)
 
+    def _is_editing(self):
+        vc = self.popover.contentViewController()
+        win = vc.view().window() if vc is not None else None
+        # NSTextField đang edit thì first responder là field editor (NSTextView).
+        return win is not None and isinstance(win.firstResponder(), NSTextView)
+
     def togglePopover_(self, sender):
         if self.popover.isShown():
             self.popover.performClose_(sender)
         else:
+            self.refresh_(None)  # mở panel = lấy giá mới; xong tự rebuild
             self._rebuild_panel()
             btn = self.status_item.button()
             self.popover.showRelativeToRect_ofView_preferredEdge_(
