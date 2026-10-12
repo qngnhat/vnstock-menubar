@@ -50,19 +50,37 @@ LIVE_INDEX_URL = "https://bgapidatafeed.vps.com.vn/getlistindexdetail/10"  # 10 
 LIVE_TIMEOUT = (1.0, 5)
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# Nghỉ trưa 11:30-13:00 giá đứng yên -> poll trong khoảng đó chỉ tốn request.
-SESSIONS = ((9 * 60, 11 * 60 + 30), (13 * 60, 15 * 60 + 5))
+# Phiên HOSE, mốc tính bằng phút trong ngày: (từ, đến, nhãn, có giá chạy).
+# Nghỉ trưa giá đứng yên -> poll trong khoảng đó chỉ tốn request.
+# Mốc cuối kéo tới 15:05 thay vì 15:00 vì giá ATC đôi khi về chậm vài phút.
+PHASES = (
+    (0, 9 * 60, "Chưa mở", False),
+    (9 * 60, 9 * 60 + 15, "ATO", True),
+    (9 * 60 + 15, 11 * 60 + 30, "Liên tục", True),
+    (11 * 60 + 30, 13 * 60, "Nghỉ trưa", False),
+    (13 * 60, 14 * 60 + 30, "Liên tục", True),
+    (14 * 60 + 30, 14 * 60 + 45, "ATC", True),
+    (14 * 60 + 45, 15 * 60 + 5, "Thỏa thuận", True),
+    (15 * 60 + 5, 24 * 60, "Đóng cửa", False),
+)
 # Stop chỉ đổi khi đỉnh đổi (bot cập nhật lúc EOD) -> không cần kéo mỗi nhịp.
 BOT_STATUS_TTL = 300
 
 
-def market_open_now(now=None):
-    """Có đang trong phiên không. Ngày lễ không biết -> bot trả trading_day."""
+def market_phase(now=None):
+    """Đang ở phiên nào -> (nhãn, giá có chạy không). Ngày lễ xem trading_day."""
     now = now or datetime.now()
     if now.weekday() >= 5:
-        return False
+        return "Nghỉ cuối tuần", False
     mins = now.hour * 60 + now.minute
-    return any(a <= mins <= b for a, b in SESSIONS)
+    for start, end, label, live in PHASES:
+        if start <= mins < end:
+            return label, live
+    return "Đóng cửa", False
+
+
+def market_open_now(now=None):
+    return market_phase(now)[1]
 
 
 def fetch_bot_status(sync_cfg):
@@ -569,6 +587,23 @@ def make_day_label(totals):
     return make_text_label(text, _pnl_color(totals["day_pnl"]), weight=0.6)
 
 
+# ATO/ATC khớp lệnh định kỳ, giá nhảy một phát rồi chốt -> tô cam cho đập vào mắt.
+PHASE_COLORS = {"ATO": VOL_HIGH, "ATC": VOL_HIGH, "Liên tục": lambda: STATUS_COLORS["up"]()}
+
+
+def make_phase_label(phase, status_text):
+    """Hàng cuối: 'ATC · Cập nhật: 14:32:10'. Nhãn phiên tô màu, phần sau xám."""
+    sep = "  ·  " if status_text else ""
+    text = f"{phase}{sep}{status_text}"
+    astr = NSMutableAttributedString.alloc().initWithString_(text)
+    astr.addAttribute_value_range_(NSFontAttributeName, _mono(weight=0.3), (0, len(text)))
+    astr.addAttribute_value_range_(NSForegroundColorAttributeName, GRAY(), (0, len(text)))
+    astr.addAttribute_value_range_(
+        NSForegroundColorAttributeName, PHASE_COLORS.get(phase, GRAY)(), (0, len(phase))
+    )
+    return NSTextField.labelWithAttributedString_(astr)
+
+
 def make_bar_title(totals):
     """Title trên menubar: lãi/lỗ hôm nay, tô xanh/đỏ. Chưa có vị thế -> icon."""
     if not totals:
@@ -690,7 +725,15 @@ class StockBarApp(NSObject):
         """Ngoài phiên thì giá đứng yên. Ngày lễ app không tự biết -> hỏi bot."""
         if not market_open_now():
             return False
+        return self._trading_day()
+
+    def _trading_day(self):
         return (self.bot_status or {}).get("trading_day", True)
+
+    def _phase_label(self):
+        phase, live = market_phase()
+        # Lễ thì giờ vẫn rơi vào khung phiên, chỉ bot mới biết là không có giao dịch.
+        return "Nghỉ lễ" if live and not self._trading_day() else phase
 
     def _applyFetchResult_(self, result):
         if result["ok"]:
@@ -787,7 +830,7 @@ class StockBarApp(NSObject):
             stack.addArrangedSubview_(make_day_label(totals))
 
         stack.addArrangedSubview_(
-            make_text_label(getattr(self, "status_text", ""), GRAY(), weight=0.3)
+            make_phase_label(self._phase_label(), getattr(self, "status_text", ""))
         )
 
         # Dòng thêm mã: [ô nhập] [Add].
