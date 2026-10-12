@@ -13,6 +13,7 @@ import requests
 from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyAccessory,
+    NSBezierPath,
     NSButton,
     NSColor,
     NSFont,
@@ -148,16 +149,16 @@ def normalize_code(raw):
     return (raw or "").strip().upper()
 
 
-def fetch_one(code, history=21):
+def fetch_one(code, sessions=21):
     """Lấy giá mã + volume trung bình để so vol hôm nay cao/thấp.
 
-    history phiên gần nhất (date:desc): phiên [0] = mới nhất (giá hiện tại),
-    [1:] = lịch sử -> tính avgVolume so với vol hôm nay. Dùng history=1 khi
+    sessions phiên gần nhất (date:desc): phiên [0] = mới nhất (giá hiện tại),
+    [1:] = lịch sử -> tính avgVolume so với vol hôm nay. Dùng sessions=1 khi
     chỉ cần kiểm tra mã tồn tại (validate). Raise nếu network/API lỗi.
     """
     resp = requests.get(
         API_URL,
-        params={"sort": "date:desc", "q": f"code:{code}", "size": history},
+        params={"sort": "date:desc", "q": f"code:{code}", "size": sessions},
         headers=HEADERS,
         timeout=10,
     )
@@ -179,6 +180,7 @@ def fetch_one(code, history=21):
         "ref": row.get("basicPrice"),
         "volume": row.get("nmVolume"),
         "avgVolume": avg_vol,
+        "history": [(r.get("date"), r.get("close")) for r in reversed(data)],
     }
 
 
@@ -213,14 +215,17 @@ def fetch_live(codes):
     return out
 
 
-_avg_volume_cache = {}  # {(code, ngày): avgVolume} — TB 20 phiên trước, trong ngày không đổi
+# {(code, ngày): (avgVolume, history)} — lịch sử phiên đã chốt, trong ngày không đổi.
+_daily_cache = {}
 
 
-def avg_volume(code):
+def daily_bars(code):
+    """TB volume + giá đóng cửa 20 phiên trước. 1 request/mã/ngày (đủ cho cả sparkline)."""
     key = (code, datetime.now().date())
-    if key not in _avg_volume_cache:
-        _avg_volume_cache[key] = fetch_one(code).get("avgVolume")
-    return _avg_volume_cache[key]
+    if key not in _daily_cache:
+        d = fetch_one(code)
+        _daily_cache[key] = (d.get("avgVolume"), d.get("history"))
+    return _daily_cache[key]
 
 
 def fetch_index(code="VNINDEX"):
@@ -281,9 +286,10 @@ def fetch_prices(codes):
         if stock is None:
             return fetch_one(code)
         try:
-            stock["avgVolume"] = avg_volume(code)
+            stock["avgVolume"], stock["history"] = daily_bars(code)
         except requests.RequestException:
-            stock["avgVolume"] = None  # thiếu avg chỉ mất màu volume, giá vẫn hiện
+            # Thiếu lịch sử chỉ mất màu volume + sparkline, giá vẫn hiện.
+            stock["avgVolume"], stock["history"] = None, None
         return stock
 
     with ThreadPoolExecutor(max_workers=min(len(codes), 8)) as ex:
@@ -411,6 +417,99 @@ def make_row_label(stock):
             NSForegroundColorAttributeName, volume_color(stock), (vol_start, vol_len)
         )
     return NSTextField.labelWithAttributedString_(astr)
+
+
+SPARK_W, SPARK_H = 54.0, 16.0
+SPARK_MIN_POINTS = 5
+SPARK_PAD = 2.0
+SPARK_STOP = lambda: _rgb(0.55, 0.55, 0.60)
+
+
+def spark_points(stock, today=None):
+    """Giá đóng cửa các phiên đã chốt + giá hiện tại làm điểm cuối -> list float.
+
+    Bỏ phiên hôm nay trong history: VNDirect snapshot trễ 1-2 phút, giá live của
+    VPS mới là điểm cuối đúng. Ít hơn SPARK_MIN_POINTS thì vẽ ra vô nghĩa -> [].
+    """
+    today = today or datetime.now().strftime("%Y-%m-%d")
+    pts = [c for d, c in (stock.get("history") or []) if c and (d or "") != today]
+    price = stock.get("price")
+    if price:
+        pts.append(price)
+    return pts if len(pts) >= SPARK_MIN_POINTS else []
+
+
+def spark_color(pts):
+    """Màu theo hướng cả cửa sổ (không phải hôm nay — màu hôm nay đã có ở cột %)."""
+    if len(pts) < 2:
+        return GRAY()
+    return STATUS_COLORS["up" if pts[-1] >= pts[0] else "down"]()
+
+
+class SparkView(NSView):
+    """Sparkline 20 phiên + vạch stop. points/stop/color gán sau alloc (make_spark_view).
+
+    Vẽ tay vì AppKit không có control nào nhẹ hơn cho cỡ 54x16pt.
+    """
+
+    def drawRect_(self, rect):
+        pts = getattr(self, "points", None) or []
+        if len(pts) < 2:
+            return
+        stop = getattr(self, "stop", None)
+        color = getattr(self, "color", None) or GRAY()
+        b = self.bounds()
+        lo, hi = min(pts), max(pts)
+        # Stop vào thang luôn: nhìn được khoảng cách tới stop mới là điểm của hình.
+        if stop:
+            lo, hi = min(lo, stop), max(hi, stop)
+        span = (hi - lo) or 1.0
+        usable_h = b.size.height - 2 * SPARK_PAD
+        usable_w = b.size.width - 2 * SPARK_PAD
+        ypos = lambda v: SPARK_PAD + (v - lo) / span * usable_h
+        xpos = lambda i: SPARK_PAD + i * usable_w / (len(pts) - 1)
+
+        path = NSBezierPath.bezierPath()
+        path.moveToPoint_((xpos(0), ypos(pts[0])))
+        for i, v in enumerate(pts[1:], 1):
+            path.lineToPoint_((xpos(i), ypos(v)))
+        # Tô nhẹ dưới đường: ở 16pt thì khối màu dễ đọc hướng hơn nét 1px.
+        area = path.copy()
+        area.lineToPoint_((xpos(len(pts) - 1), 0.0))
+        area.lineToPoint_((xpos(0), 0.0))
+        area.closePath()
+        color.colorWithAlphaComponent_(0.15).setFill()
+        area.fill()
+        if stop:
+            line = NSBezierPath.bezierPath()
+            line.moveToPoint_((0.0, ypos(stop)))
+            line.lineToPoint_((b.size.width, ypos(stop)))
+            line.setLineWidth_(1.0)
+            line.setLineDash_count_phase_([2.0, 2.0], 2, 0.0)
+            SPARK_STOP().setStroke()
+            line.stroke()
+
+        color.setStroke()
+        path.setLineWidth_(1.2)
+        path.stroke()
+
+        dot = NSBezierPath.bezierPathWithOvalInRect_(
+            NSMakeRect(xpos(len(pts) - 1) - 1.6, ypos(pts[-1]) - 1.6, 3.2, 3.2)
+        )
+        color.setFill()
+        dot.fill()
+
+
+def make_spark_view(stock, stop):
+    """Luôn trả view (rỗng khi thiếu lịch sử) để các cột sau thẳng hàng mọi row."""
+    v = SparkView.alloc().initWithFrame_(NSMakeRect(0, 0, SPARK_W, SPARK_H))
+    pts = spark_points(stock)
+    v.points = pts
+    v.stop = stop
+    v.color = spark_color(pts)
+    v.widthAnchor().constraintEqualToConstant_(SPARK_W).setActive_(True)
+    v.heightAnchor().constraintEqualToConstant_(SPARK_H).setActive_(True)
+    return v
 
 
 def make_text_label(text, color, weight=0.4):
@@ -617,6 +716,11 @@ def make_bar_title(totals):
     return astr
 
 
+def bot_stop(info):
+    """Pick bot thì stop theo luật tier; mã mua tay worker tự dựng mức tham chiếu."""
+    return ((info or {}).get("bot") or (info or {}).get("manual") or {}).get("stop")
+
+
 def format_bot_hint(price, info, near_pct):
     """Một ô cho cả stop lẫn T+ -> (text, color). Ưu tiên cái gấp hơn.
 
@@ -624,8 +728,7 @@ def format_bot_hint(price, info, near_pct):
     """
     if not info:
         return "", GRAY()
-    # Pick bot thì stop theo luật tier; mã mua tay worker tự dựng mức tham chiếu.
-    stop = (info.get("bot") or info.get("manual") or {}).get("stop")
+    stop = bot_stop(info)
     if stop and price is not None:
         if price <= stop:
             return f"⛔ thủng {stop:.2f}", STATUS_COLORS["down"]()
@@ -785,6 +888,10 @@ class StockBarApp(NSObject):
             row.setSpacing_(8.0)
             row.addArrangedSubview_(make_row_label(s))
 
+            info = (self.bot_status or {}).get("by_code", {}).get(code)
+            near_pct = (self.bot_status or {}).get("near_pct", 2)
+            row.addArrangedSubview_(make_spark_view(s, bot_stop(info)))
+
             # Ô nhập giá mua + vol đã mua (tag=index để handler map ra code).
             target = self.targets.get(code)
             qty = self.quantities.get(code)
@@ -807,11 +914,7 @@ class StockBarApp(NSObject):
             row.addArrangedSubview_(diff_lbl)
 
             # Stop của bot + hạn T+ — cùng một ô, cái nào gấp hơn thì hiện.
-            hint_text, hint_color = format_bot_hint(
-                s.get("price"),
-                (self.bot_status or {}).get("by_code", {}).get(code),
-                (self.bot_status or {}).get("near_pct", 2),
-            )
+            hint_text, hint_color = format_bot_hint(s.get("price"), info, near_pct)
             hint_lbl = make_text_label(hint_text, hint_color, weight=0.5)
             hint_lbl.setAlignment_(NSTextAlignmentRight)
             hint_lbl.widthAnchor().constraintEqualToConstant_(126.0).setActive_(True)
@@ -925,7 +1028,7 @@ class StockBarApp(NSObject):
 
     def _validate_bg(self, code):
         try:
-            valid = fetch_one(code, history=1).get("price") is not None
+            valid = fetch_one(code, sessions=1).get("price") is not None
         except Exception:
             valid = False  # lỗi mạng coi như chưa xác thực được -> báo lỗi
         self.performSelectorOnMainThread_withObject_waitUntilDone_(
