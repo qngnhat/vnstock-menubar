@@ -589,8 +589,8 @@ def format_bot_hint(price, info, near_pct):
     """
     if not info:
         return "", GRAY()
-    bot = info.get("bot")
-    stop = (bot or {}).get("stop")
+    # Pick bot thì stop theo luật tier; mã mua tay worker tự dựng mức tham chiếu.
+    stop = (info.get("bot") or info.get("manual") or {}).get("stop")
     if stop and price is not None:
         if price <= stop:
             return f"⛔ thủng {stop:.2f}", STATUS_COLORS["down"]()
