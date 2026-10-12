@@ -4,6 +4,7 @@
 import json
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -35,7 +36,7 @@ from AppKit import (
     NSViewController,
 )
 from Cocoa import CAKeyframeAnimation
-from Foundation import NSObject
+from Foundation import NSObject, NSTimer
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 API_URL = "https://api-finfo.vndirect.com.vn/v4/stock_prices"
@@ -48,6 +49,45 @@ LIVE_INDEX_URL = "https://bgapidatafeed.vps.com.vn/getlistindexdetail/10"  # 10 
 # bỏ nhanh sang IP sau, không thì mỗi lần fetch treo 10-15s.
 LIVE_TIMEOUT = (1.0, 5)
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+# Nghỉ trưa 11:30-13:00 giá đứng yên -> poll trong khoảng đó chỉ tốn request.
+SESSIONS = ((9 * 60, 11 * 60 + 30), (13 * 60, 15 * 60 + 5))
+# Stop chỉ đổi khi đỉnh đổi (bot cập nhật lúc EOD) -> không cần kéo mỗi nhịp.
+BOT_STATUS_TTL = 300
+
+
+def market_open_now(now=None):
+    """Có đang trong phiên không. Ngày lễ không biết -> bot trả trading_day."""
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    mins = now.hour * 60 + now.minute
+    return any(a <= mins <= b for a, b in SESSIONS)
+
+
+def fetch_bot_status(sync_cfg):
+    """Stop + hạn giữ + ngày bán được, từ worker. Lỗi -> None, panel hiện như cũ."""
+    url = (sync_cfg or {}).get("url")
+    key = (sync_cfg or {}).get("key")
+    if not url or not key:
+        return None
+    try:
+        resp = requests.get(
+            url.replace("/portfolio/sync", "/portfolio/status"),
+            params={"key": key}, timeout=10,
+        )
+        if resp.status_code != 200:
+            print(f"[status] HTTP {resp.status_code}", flush=True)
+            return None
+        data = resp.json()
+        return {
+            "by_code": {r["symbol"]: r for r in data.get("positions", [])},
+            "near_pct": data.get("near_pct") or 2,
+            "trading_day": data.get("trading_day", True),
+        }
+    except Exception as e:  # payload lạ cũng không được làm chết luôn phần giá
+        print(f"[status] lỗi: {e}", flush=True)
+        return None
 
 
 def _rgb(r, g, b):
@@ -409,22 +449,31 @@ def portfolio_totals(codes, targets, quantities, by_code):
 
     Đơn vị tiền = nghìn đồng (giá VNDirect là nghìn đồng, qty là số cp).
     nav = Σ giá_hiện_tại × qty; cost = Σ giá_mua × qty; pnl = nav - cost.
+    Lãi/lỗ HÔM NAY tính so giá tham chiếu, khác pnl (so giá vốn): trong phiên cái
+    cần biết là hôm nay được mất bao nhiêu, không phải lãi từ hồi mua.
     """
-    cost = nav = 0.0
+    cost = nav = prev = 0.0
     counted = 0
     for code in codes:
         t, q = targets.get(code), quantities.get(code)
-        price = (by_code.get(code) or {}).get("price")
+        stock = by_code.get(code) or {}
+        price = stock.get("price")
         if not t or not q or price is None:
             continue
         counted += 1
         cost += t * q
         nav += price * q
+        prev += (stock.get("ref") or price) * q
     if not counted:
         return None
     pnl = nav - cost
     pct = (pnl / cost * 100) if cost else 0.0
-    return {"nav": nav, "cost": cost, "pnl": pnl, "pct": pct, "count": counted}
+    day_pnl = nav - prev
+    day_pct = (day_pnl / prev * 100) if prev else 0.0
+    return {
+        "nav": nav, "cost": cost, "pnl": pnl, "pct": pct, "count": counted,
+        "day_pnl": day_pnl, "day_pct": day_pct,
+    }
 
 
 def build_holdings(targets, quantities, dates):
@@ -502,6 +551,60 @@ def make_total_label(totals):
     return NSTextField.labelWithAttributedString_(astr)
 
 
+def _pnl_color(v):
+    return STATUS_COLORS["up"]() if v > 0 else (
+        STATUS_COLORS["down"]() if v < 0 else STATUS_COLORS["ref"]()
+    )
+
+
+def _pnl_text(v, pct):
+    arrow = "▲" if v > 0 else ("▼" if v < 0 else "—")
+    sign = "+" if v > 0 else ""
+    return f"{arrow}{sign}{format_money(v)} {sign}{pct:.1f}%"
+
+
+def make_day_label(totals):
+    """Hàng 'HÔM NAY ▼-1.2tr -2.8%' — lãi/lỗ trong phiên, so giá tham chiếu."""
+    text = f"HÔM NAY  {_pnl_text(totals['day_pnl'], totals['day_pct'])}"
+    return make_text_label(text, _pnl_color(totals["day_pnl"]), weight=0.6)
+
+
+def make_bar_title(totals):
+    """Title trên menubar: lãi/lỗ hôm nay, tô xanh/đỏ. Chưa có vị thế -> icon."""
+    if not totals:
+        return None
+    text = _pnl_text(totals["day_pnl"], totals["day_pct"])
+    astr = NSMutableAttributedString.alloc().initWithString_(text)
+    astr.addAttribute_value_range_(NSFontAttributeName, _mono(size=12.0, weight=0.5), (0, len(text)))
+    astr.addAttribute_value_range_(
+        NSForegroundColorAttributeName, _pnl_color(totals["day_pnl"]), (0, len(text))
+    )
+    return astr
+
+
+def format_bot_hint(price, info, near_pct):
+    """Một ô cho cả stop lẫn T+ -> (text, color). Ưu tiên cái gấp hơn.
+
+    Chỉ hiện ràng buộc đang có hiệu lực: đã bán được rồi thì không cần nhắc T+.
+    """
+    if not info:
+        return "", GRAY()
+    bot = info.get("bot")
+    stop = (bot or {}).get("stop")
+    if stop and price is not None:
+        if price <= stop:
+            return f"⛔ thủng {stop:.2f}", STATUS_COLORS["down"]()
+        gap = (price - stop) / price * 100
+        if gap <= near_pct:
+            return f"⚠ stop {stop:.2f} {gap:.1f}%", VOL_HIGH()
+    if info.get("sellable") is False and info.get("sellable_date"):
+        d = info["sellable_date"][8:10] + "/" + info["sellable_date"][5:7]
+        return f"bán {d}", GRAY()
+    if stop:
+        return f"stop {stop:.2f}", GRAY()
+    return "", GRAY()
+
+
 class StockBarApp(NSObject):
     """App thuần PyObjC: NSStatusItem (icon) + NSPopover nền trắng. Fetch thủ công."""
 
@@ -516,6 +619,8 @@ class StockBarApp(NSObject):
         self.dates = self.cfg["dates"]
         self.last_stocks = None
         self.last_index = None
+        self.bot_status = None
+        self.bot_status_at = 0.0
 
         # Status item + icon topbar; click button -> toggle popover.
         self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
@@ -529,7 +634,13 @@ class StockBarApp(NSObject):
         self.popover = NSPopover.alloc().init()
         self.popover.setBehavior_(NSPopoverBehaviorTransient)  # click ngoài -> đóng
 
-        self.refresh_(None)  # fetch 1 lần lúc mở; sau đó fetch khi mở panel hoặc bấm Refresh
+        # refresh_seconds vốn là config chết: không có timer nào, giá chỉ mới khi
+        # mở panel. Timer chỉ fetch trong phiên (xem refresh_).
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            float(self.cfg["refresh_seconds"]), self, "refresh:", None, True
+        )
+
+        self.refresh_(None)  # fetch ngay lúc mở, khỏi chờ hết nhịp timer đầu
         # Đẩy 1 lần lúc mở: danh mục có thể đã đổi ở lần chạy trước mà push hỏng,
         # hoặc bảng bên bot vừa được tạo lại.
         self._stamp_dates()
@@ -538,23 +649,33 @@ class StockBarApp(NSObject):
         return self
 
     # --- data ---
-    def refresh_(self, _timer):
-        """Kick off fetch trên background thread; UI không bao giờ đơ vì mạng."""
+    def refresh_(self, timer):
+        """Kick off fetch trên background thread; UI không bao giờ đơ vì mạng.
+
+        Timer gọi (timer != None) thì chỉ fetch trong phiên; gọi tay thì luôn fetch.
+        """
+        if timer is not None and not self._should_poll():
+            return
         codes = list(self.codes)  # snapshot, tránh race khi user đang edit
         threading.Thread(target=self._fetch_bg, args=(codes,), daemon=True).start()
 
     def _fetch_bg(self, codes):
         now = datetime.now().strftime("%H:%M:%S")
+        want_status = time.time() - self.bot_status_at > BOT_STATUS_TTL
         try:
             # Index + watchlist fetch song song để không cộng dồn latency.
-            with ThreadPoolExecutor(max_workers=2) as ex:
+            with ThreadPoolExecutor(max_workers=3) as ex:
                 fut_index = ex.submit(fetch_index)
                 fut_stocks = ex.submit(fetch_prices, codes)
+                fut_bot = ex.submit(fetch_bot_status, self.cfg.get("sync")) if want_status else None
                 index = fut_index.result()
                 stocks = fut_stocks.result()
+                bot = fut_bot.result() if fut_bot else None
             result = {
                 "stocks": stocks,
                 "index": index,
+                "bot": bot,
+                "status_tried": want_status,
                 "status": f"Cập nhật: {now}",
                 "ok": True,
             }
@@ -565,11 +686,22 @@ class StockBarApp(NSObject):
             "_applyFetchResult:", result, False
         )
 
+    def _should_poll(self):
+        """Ngoài phiên thì giá đứng yên. Ngày lễ app không tự biết -> hỏi bot."""
+        if not market_open_now():
+            return False
+        return (self.bot_status or {}).get("trading_day", True)
+
     def _applyFetchResult_(self, result):
         if result["ok"]:
             self.last_stocks = result["stocks"]
             self.last_index = result["index"]
-            self.status_item.button().setTitle_("📈")
+            if result.get("bot") is not None:
+                self.bot_status = result["bot"]
+            # Đánh dấu cả khi bot lỗi, kẻo 30 giây lại gọi lại một endpoint đang hỏng.
+            if result.get("status_tried"):
+                self.bot_status_at = time.time()
+            self._update_bar_title()
         else:
             self.status_item.button().setTitle_("⚠️")
         self.status_text = result["status"]
@@ -578,6 +710,17 @@ class StockBarApp(NSObject):
             self._rebuild_panel()
 
     # --- UI ---
+    def _update_bar_title(self):
+        """Lãi/lỗ hôm nay hiện thẳng trên menubar — khỏi phải mở panel mới biết."""
+        by_code = {s["code"]: s for s in (self.last_stocks or [])}
+        totals = portfolio_totals(self.codes, self.targets, self.quantities, by_code)
+        astr = make_bar_title(totals)
+        btn = self.status_item.button()
+        if astr is None:
+            btn.setTitle_("📈")
+        else:
+            btn.setAttributedTitle_(astr)
+
     def _rebuild_panel(self):
         stack = NSStackView.alloc().initWithFrame_(NSMakeRect(0, 0, 10, 10))
         stack.setOrientation_(NSUserInterfaceLayoutOrientationVertical)
@@ -620,6 +763,17 @@ class StockBarApp(NSObject):
             diff_lbl.widthAnchor().constraintEqualToConstant_(54.0).setActive_(True)
             row.addArrangedSubview_(diff_lbl)
 
+            # Stop của bot + hạn T+ — cùng một ô, cái nào gấp hơn thì hiện.
+            hint_text, hint_color = format_bot_hint(
+                s.get("price"),
+                (self.bot_status or {}).get("by_code", {}).get(code),
+                (self.bot_status or {}).get("near_pct", 2),
+            )
+            hint_lbl = make_text_label(hint_text, hint_color, weight=0.5)
+            hint_lbl.setAlignment_(NSTextAlignmentRight)
+            hint_lbl.widthAnchor().constraintEqualToConstant_(126.0).setActive_(True)
+            row.addArrangedSubview_(hint_lbl)
+
             x_btn = NSButton.buttonWithTitle_target_action_("✕", self, "onRemove:")
             x_btn.setTag_(i)
             x_btn.setBezelStyle_(0)  # bezel gọn
@@ -630,6 +784,7 @@ class StockBarApp(NSObject):
         totals = portfolio_totals(self.codes, self.targets, self.quantities, by_code)
         if totals:
             stack.addArrangedSubview_(make_total_label(totals))
+            stack.addArrangedSubview_(make_day_label(totals))
 
         stack.addArrangedSubview_(
             make_text_label(getattr(self, "status_text", ""), GRAY(), weight=0.3)
@@ -853,6 +1008,7 @@ class StockBarApp(NSObject):
         save_config(self.cfg)
         self._rebuild_panel()
         self._sync_bg()
+        self.bot_status_at = 0.0  # vị thế đổi -> T+ đổi, kéo lại ở nhịp tới
 
     def _apply_watchlist_change(self):
         """Ghi config.json + rebuild ngay (phản hồi tức thì) + fetch mã mới ở nền."""
@@ -862,6 +1018,7 @@ class StockBarApp(NSObject):
         self._stamp_dates()
         save_config(self.cfg)
         self._rebuild_panel()  # hiện ngay list mới (mã mới = '—' tới khi fetch xong)
+        self.bot_status_at = 0.0  # mã mới có thể là pick bot -> kéo stop ngay
         self.refresh_(None)    # fetch nền, xong tự rebuild lại
         self._sync_bg()
 
