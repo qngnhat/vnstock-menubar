@@ -80,10 +80,6 @@ def market_phase(now=None):
     return "Đóng cửa", False
 
 
-def market_open_now(now=None):
-    return market_phase(now)[1]
-
-
 def fetch_bot_status(sync_cfg):
     """Stop + hạn giữ + ngày bán được, từ worker. Lỗi -> None, panel hiện như cũ."""
     url = (sync_cfg or {}).get("url")
@@ -703,17 +699,26 @@ def make_phase_label(phase, status_text):
     return NSTextField.labelWithAttributedString_(astr)
 
 
-def make_bar_title(totals):
-    """Title trên menubar: lãi/lỗ hôm nay, tô xanh/đỏ. Chưa có vị thế -> icon."""
-    if not totals:
-        return None
-    text = _pnl_text(totals["day_pnl"], totals["day_pct"])
+def _bar_astr(text, color):
     astr = NSMutableAttributedString.alloc().initWithString_(text)
     astr.addAttribute_value_range_(NSFontAttributeName, _mono(size=12.0, weight=0.5), (0, len(text)))
-    astr.addAttribute_value_range_(
-        NSForegroundColorAttributeName, _pnl_color(totals["day_pnl"]), (0, len(text))
-    )
+    astr.addAttribute_value_range_(NSForegroundColorAttributeName, color, (0, len(text)))
     return astr
+
+
+def make_bar_title(totals, phase, live):
+    """Title menubar: lãi/lỗ TỔNG khi giá đang chạy, ngoài phiên thì chỉ nhãn phiên.
+
+    Ngoài giờ con số đứng yên cả tối mà vẫn xanh/đỏ -> trông như đang biến động;
+    nhãn phiên vừa trung thực vừa cho biết bao giờ số mới có nghĩa trở lại.
+    labelColor chứ không phải màu tự set: menubar đổi sáng/tối theo hệ thống.
+    Chưa có vị thế -> None (caller để icon).
+    """
+    if not live:
+        return _bar_astr(phase, NSColor.labelColor())
+    if not totals:
+        return None
+    return _bar_astr(_pnl_text(totals["pnl"], totals["pct"]), _pnl_color(totals["pnl"]))
 
 
 def bot_stop(info):
@@ -825,18 +830,19 @@ class StockBarApp(NSObject):
         )
 
     def _should_poll(self):
-        """Ngoài phiên thì giá đứng yên. Ngày lễ app không tự biết -> hỏi bot."""
-        if not market_open_now():
-            return False
-        return self._trading_day()
+        """Ngoài phiên thì giá đứng yên -> không tốn request."""
+        return self._phase()[1]
 
     def _trading_day(self):
         return (self.bot_status or {}).get("trading_day", True)
 
-    def _phase_label(self):
+    def _phase(self):
+        """(nhãn phiên, giá có chạy không). Ngày lễ app không tự biết -> hỏi bot."""
         phase, live = market_phase()
         # Lễ thì giờ vẫn rơi vào khung phiên, chỉ bot mới biết là không có giao dịch.
-        return "Nghỉ lễ" if live and not self._trading_day() else phase
+        if live and not self._trading_day():
+            return "Nghỉ lễ", False
+        return phase, live
 
     def _applyFetchResult_(self, result):
         if result["ok"]:
@@ -857,10 +863,10 @@ class StockBarApp(NSObject):
 
     # --- UI ---
     def _update_bar_title(self):
-        """Lãi/lỗ hôm nay hiện thẳng trên menubar — khỏi phải mở panel mới biết."""
+        """Lãi/lỗ tổng hiện thẳng trên menubar — khỏi phải mở panel mới biết."""
         by_code = {s["code"]: s for s in (self.last_stocks or [])}
         totals = portfolio_totals(self.codes, self.targets, self.quantities, by_code)
-        astr = make_bar_title(totals)
+        astr = make_bar_title(totals, *self._phase())
         btn = self.status_item.button()
         if astr is None:
             btn.setTitle_("📈")
@@ -933,7 +939,7 @@ class StockBarApp(NSObject):
             stack.addArrangedSubview_(make_day_label(totals))
 
         stack.addArrangedSubview_(
-            make_phase_label(self._phase_label(), getattr(self, "status_text", ""))
+            make_phase_label(self._phase()[0], getattr(self, "status_text", ""))
         )
 
         # Dòng thêm mã: [ô nhập] [Add].
